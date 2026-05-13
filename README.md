@@ -2,7 +2,7 @@
 
 This repository documents how to run an email server on OpenBSD using built-in components:
 
-- `smtpd(8)` (OpenSMTPD) for SMTP receive/relay
+- `smtpd(8)` (OpenSMTPD) for SMTP receive, transmission (submission), and relay
 - `mail.local(8)` for local mailbox delivery (`mbox`)
 - `acme-client(1)` + `openssl(1)` for TLS certificates
 - `pf(4)` for network exposure control
