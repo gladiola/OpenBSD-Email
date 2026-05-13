@@ -107,16 +107,170 @@ Inspect logs:
 - Restrict exposed ports with `pf` (typically 25, 465, 587 as needed).
 - Prefer authenticated submission for users; do not run an open relay.
 
-## 6) mTLS availability
+## 6) mTLS with OpenBSD built-ins (laptop submission)
 
-OpenSMTPD supports mutual TLS on listeners:
+The steps below implement a strict mTLS path from a laptop to your OpenSMTPD submission listener using only built-in OpenBSD tools (`openssl`, `smtpd`, `pf`).
 
-- `listen ... smtps verify`
-- `listen ... tls-require verify`
+### 6.1 Create a private CA and issue server/client certs
 
-With `verify`, clients must present a valid certificate. Pair this with a `ca` definition (for example `ca local_ca cert "/etc/ssl/local-ca.pem"`) and reference that CA on the listener (`listen ... ca local_ca ...`). This is useful for controlled MTA-to-MTA or device-to-MTA environments.
+Create a CA for client authentication and keep its private key offline if possible:
 
-For general end-user submission, certificate-based mTLS is usually combined with or replaced by SMTP AUTH, because distributing client certs to all users is operationally heavier.
+```sh
+# install -d -m 700 /etc/ssl/my-mail-ca
+# openssl genrsa -out /etc/ssl/my-mail-ca/ca.key 4096
+# openssl req -x509 -new -nodes -sha256 -days 3650 \
+    -key /etc/ssl/my-mail-ca/ca.key \
+    -out /etc/ssl/my-mail-ca/ca.crt \
+    -subj "/CN=My Mail Client CA"
+```
+
+Issue a server certificate for your mail host:
+
+```sh
+# openssl genrsa -out /etc/ssl/private/mail.example.net.key 4096
+# openssl req -new -key /etc/ssl/private/mail.example.net.key \
+    -out /etc/ssl/mail.example.net.csr \
+    -subj "/CN=mail.example.net"
+# printf "subjectAltName=DNS:mail.example.net\nextendedKeyUsage=serverAuth\n" \
+    > /tmp/server-ext.cnf
+# openssl x509 -req -in /etc/ssl/mail.example.net.csr \
+    -CA /etc/ssl/my-mail-ca/ca.crt -CAkey /etc/ssl/my-mail-ca/ca.key \
+    -CAcreateserial -out /etc/ssl/mail.example.net.crt \
+    -days 825 -sha256 -extfile /tmp/server-ext.cnf
+# cat /etc/ssl/mail.example.net.crt /etc/ssl/my-mail-ca/ca.crt \
+    > /etc/ssl/mail.example.net.fullchain.pem
+```
+
+Issue a client certificate for the laptop (clientAuth EKU):
+
+```sh
+# openssl genrsa -out /etc/ssl/my-mail-ca/laptop01.key 4096
+# openssl req -new -key /etc/ssl/my-mail-ca/laptop01.key \
+    -out /etc/ssl/my-mail-ca/laptop01.csr \
+    -subj "/CN=laptop01"
+# printf "extendedKeyUsage=clientAuth\n" > /tmp/client-ext.cnf
+# openssl x509 -req -in /etc/ssl/my-mail-ca/laptop01.csr \
+    -CA /etc/ssl/my-mail-ca/ca.crt -CAkey /etc/ssl/my-mail-ca/ca.key \
+    -CAcreateserial -out /etc/ssl/my-mail-ca/laptop01.crt \
+    -days 825 -sha256 -extfile /tmp/client-ext.cnf
+```
+
+### 6.2 Require mTLS in OpenSMTPD submission listener
+
+Example `/etc/mail/smtpd.conf` snippet:
+
+```conf
+pki mail.example.net cert "/etc/ssl/mail.example.net.fullchain.pem"
+pki mail.example.net key "/etc/ssl/private/mail.example.net.key"
+ca mtls_clients cert "/etc/ssl/my-mail-ca/ca.crt"
+
+# RFC 5737/3849 documentation ranges; replace with your real laptop/VPN source(s).
+table <mtls_sources> { 198.51.100.44, 10.8.0.0/24 }
+
+action "local_mbox" mbox alias <aliases>
+action "outbound" relay
+
+match from local for local action "local_mbox"
+match from local for any action "outbound"
+
+# Public inbound SMTP (no client cert required)
+listen on egress tls pki mail.example.net
+
+# Submission: TLS required + valid client cert from mtls_clients CA
+listen on egress port submission tls-require pki mail.example.net ca mtls_clients verify
+
+# Keep relay tight to expected source(s)
+match from src <mtls_sources> for any action "outbound"
+```
+
+Validate and reload:
+
+```sh
+# smtpd -n
+# rcctl restart smtpd
+```
+
+### 6.3 Restrict network exposure with `pf`
+
+Only allow submission from expected laptop/VPN sources:
+
+```pf
+# Keep this in sync with smtpd.conf <mtls_sources>.
+table <mtls_submit_clients> { 198.51.100.44, 10.8.0.0/24 }
+
+pass in on egress proto tcp from <mtls_submit_clients> to (egress) port 587
+block in on egress proto tcp to (egress) port 587
+```
+
+Load and verify:
+
+```sh
+# pfctl -nf /etc/pf.conf
+# pfctl -f /etc/pf.conf
+```
+
+### 6.4 Install laptop credentials and trust
+
+Copy to laptop:
+- `laptop01.crt` (client cert)
+- `laptop01.key` (client key, mode `0600`)
+- `ca.crt` (for verifying server cert chain)
+
+On OpenBSD laptop:
+
+```sh
+# install -d -m 700 /etc/ssl/private
+# install -m 600 laptop01.key /etc/ssl/private/laptop01.key
+# install -m 644 laptop01.crt /etc/ssl/laptop01.crt
+# install -m 644 ca.crt /etc/ssl/my-mail-ca.crt
+```
+
+### 6.5 Send an email from laptop with OpenSSL STARTTLS + mTLS
+
+Use OpenSSL interactive SMTP session (the EHLO name does not need to match the
+certificate CN, but keeping naming consistent is a good operational practice):
+
+```sh
+$ openssl s_client -starttls smtp -crlf -quiet \
+    -connect mail.example.net:587 \
+    -cert /etc/ssl/laptop01.crt \
+    -key /etc/ssl/private/laptop01.key \
+    -CAfile /etc/ssl/my-mail-ca.crt \
+    -verify_return_error
+EHLO laptop01.example.net
+MAIL FROM:<user@example.net>
+RCPT TO:<dest@example.org>
+DATA
+Subject: mTLS test
+
+hello from laptop over mTLS
+.
+QUIT
+```
+
+### 6.6 Validate end-to-end
+
+On laptop:
+- Ensure TLS verification succeeds (no certificate verify error from `openssl s_client`).
+
+On server:
+
+```sh
+# tail -f /var/log/maillog
+# smtpctl show queue
+# smtpctl show status
+```
+
+Confirm logs show successful client certificate verification and the message is accepted/queued/delivered.
+
+### 6.7 Operational hardening
+
+- Issue one client cert per device/user; do not share keys.
+- Revoke and reissue certs for lost/retired devices.
+- Rotate CA/certs on a defined schedule.
+- Keep CA private key offline or heavily restricted.
+- Alert on repeated mTLS verification failures and unknown source IPs.
+- Combine mTLS with `pf` source restrictions for defense in depth.
 
 ## 7) DNS records
 
