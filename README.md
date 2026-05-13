@@ -184,8 +184,8 @@ Add the filter to `/etc/mail/smtpd.conf`:
 filter "dkimsign" proc-exec "filter-dkimsign -d example.com -s mail \
     -k /etc/mail/dkim/mail.example.com.key"
 
-listen on egress tls pki mail.example.net filter "dkimsign"
-listen on egress port submission tls-require pki mail.example.net auth filter "dkimsign"
+listen on egress tls pki mail.example.com filter "dkimsign"
+listen on egress port submission tls-require pki mail.example.com auth filter "dkimsign"
 ```
 
 Extract the public key to paste into the `mail._domainkey` TXT record:
