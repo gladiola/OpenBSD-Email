@@ -164,6 +164,7 @@ pki mail.example.net cert "/etc/ssl/mail.example.net.fullchain.pem"
 pki mail.example.net key "/etc/ssl/private/mail.example.net.key"
 ca mtls_clients cert "/etc/ssl/my-mail-ca/ca.crt"
 
+# RFC 5737/3849 documentation ranges; replace with your real laptop/VPN source(s).
 table <mtls_sources> { 198.51.100.44, 10.8.0.0/24 }
 
 action "local_mbox" mbox alias <aliases>
@@ -194,6 +195,7 @@ Validate and reload:
 Only allow submission from expected laptop/VPN sources:
 
 ```pf
+# Keep this in sync with smtpd.conf <mtls_sources>.
 table <mtls_submit_clients> { 198.51.100.44, 10.8.0.0/24 }
 
 pass in on egress proto tcp from <mtls_submit_clients> to (egress) port 587
@@ -204,7 +206,7 @@ Load and verify:
 
 ```sh
 # pfctl -nf /etc/pf.conf
-# rcctl reload pf
+# pfctl -f /etc/pf.conf
 ```
 
 ### 6.4 Install laptop credentials and trust
@@ -225,7 +227,8 @@ On OpenBSD laptop:
 
 ### 6.5 Send an email from laptop with OpenSSL STARTTLS + mTLS
 
-Use OpenSSL interactive SMTP session:
+Use OpenSSL interactive SMTP session (the EHLO name does not need to match the
+certificate CN, but keeping naming consistent is a good operational practice):
 
 ```sh
 $ openssl s_client -starttls smtp -crlf -quiet \
