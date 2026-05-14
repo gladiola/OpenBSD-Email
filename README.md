@@ -353,3 +353,112 @@ Wrap that value in `"v=DKIM1; k=rsa; p=..."` in your zone file, re-sign the zone
 ### DNSSEC interaction
 
 If you are signing your zone with DNSSEC (see [OpenBSD-DNSSEC](https://github.com/gladiola/OpenBSD-DNSSEC)), `ldns-signzone` automatically adds RRSIG records for every RRset — including the TXT records for SPF, DKIM, and DMARC — at no additional configuration cost. This prevents an attacker from tampering with your mail policy records in transit.
+
+## 8) Cloud-hybrid ingress/egress with two public relays
+
+This pattern keeps your on-prem mail host private while using two cloud relays (`mx1`, `mx2`) for public SMTP.
+
+### 8.1 Topology
+
+- Public Internet reaches only cloud relays:
+  - `mx1.example.com` (cloud node 1)
+  - `mx2.example.com` (cloud node 2)
+- On-prem host is not published as an MX target.
+- Relay-to-on-prem traffic uses private transport (WireGuard/IPsec/MPLS) with TLS (prefer mTLS).
+- Outbound mail from on-prem goes through the same cloud relays as smarthosts.
+
+### 8.2 DNS records (authoritative zone)
+
+Example zone entries:
+
+```dns
+; Public relay host records
+mx1         IN  A       198.51.100.10
+mx1         IN  AAAA    2001:db8:100::10
+mx2         IN  A       198.51.100.20
+mx2         IN  AAAA    2001:db8:100::20
+
+; Domain MX points only to cloud relays
+@           IN  MX  10  mx1.example.com.
+@           IN  MX  10  mx2.example.com.
+
+; SPF authorizes relay egress IPs
+@           IN  TXT     "v=spf1 ip4:198.51.100.10 ip4:198.51.100.20 ip6:2001:db8:100::10 ip6:2001:db8:100::20 -all"
+
+; DKIM selector used by your signer (relay or on-prem, but be consistent)
+mail._domainkey  IN  TXT "v=DKIM1; k=rsa; p=<base64-public-key>"
+
+; DMARC rollout: start with p=none, later quarantine/reject
+_dmarc      IN  TXT     "v=DMARC1; p=none; rua=mailto:postmaster@example.com; adkim=s; aspf=s"
+```
+
+Reverse DNS must be configured with the IP provider for each relay IP:
+
+```text
+10.100.51.198.in-addr.arpa.  IN PTR mx1.example.com.
+20.100.51.198.in-addr.arpa.  IN PTR mx2.example.com.
+```
+
+Ensure forward-confirmed reverse DNS (PTR name resolves back to the same relay IP).
+
+### 8.3 Cloud relay `smtpd` role (inbound + egress)
+
+Each relay should:
+- accept inbound SMTP for hosted domains only
+- relay accepted mail to on-prem via private next-hop
+- queue if on-prem is temporarily unavailable
+- relay outbound mail from trusted on-prem sources
+
+Example relay policy shape:
+
+```conf
+# /etc/mail/smtpd.conf (relay role, simplified shape)
+table <hosted_domains> { example.com, example.net }
+table <onprem_sources> { 10.50.0.10, 10.50.0.11 }
+
+action "to_onprem" relay host smtp+tls://10.60.0.5
+action "to_internet" relay
+
+# Inbound from Internet: only hosted domains
+match from any for domain <hosted_domains> action "to_onprem"
+
+# Outbound from on-prem only
+match from src <onprem_sources> for any action "to_internet"
+```
+
+Harden relay listeners with:
+- `tls-require` where appropriate
+- optional `ca ... verify` for mTLS on private paths
+- strict `pf` allowlists on private SMTP ports
+- no open relay rules
+
+### 8.4 On-prem `smtpd` role (private behind relays)
+
+On-prem should:
+- listen on private/VPN interface for relay-originated SMTP
+- trust only relay source IPs/certs
+- send outbound via relay smarthost(s), not direct Internet
+
+Example egress via dual smarthost table:
+
+```conf
+# /etc/mail/smtpd.conf (on-prem, outbound shape)
+table <relay_smtphosts> { smtp+tls://mx1.example.com, smtp+tls://mx2.example.com }
+action "outbound_via_relays" relay host <relay_smtphosts>
+match from local for any action "outbound_via_relays"
+```
+
+### 8.5 Authentication alignment and identity
+
+- Keep HELO/EHLO identity aligned with relay hostnames.
+- Ensure relay certificates include correct CN/SAN (`mx1.example.com`, `mx2.example.com`).
+- If DKIM signing happens on relays, publish selector TXT for relay keys.
+- If DKIM signing happens on-prem, keep the same signing domain/alignment policy and verify SPF still references relay egress identities.
+- Start DMARC with `p=none`, monitor reports, then move to `p=quarantine` and eventually `p=reject`.
+
+### 8.6 Operational safeguards
+
+- Enable anti-abuse controls on relays (rate limits, RBL/antispam filters, strict relay ACLs).
+- Monitor queue depth and defer/fail rates on both relays and on-prem.
+- Alert on TLS/mTLS verification failures and unexpected source IPs.
+- Test failover regularly by taking one relay offline and confirming mail still flows through the remaining relay.
